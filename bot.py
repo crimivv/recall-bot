@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import datetime as dt
+import hashlib
 import json
 import os
 import pathlib
@@ -106,6 +107,12 @@ def banner_attachments() -> list[discord.File]:
     return []
 
 
+def banner_hash() -> str | None:
+    if not BANNER_FILE.exists():
+        return None
+    return hashlib.sha256(BANNER_FILE.read_bytes()).hexdigest()
+
+
 async def fetch_card_message() -> discord.Message | None:
     card_id = load_state().get("card_message_id")
     if not card_id:
@@ -125,19 +132,21 @@ async def refresh_card(version: str, detected_at: dt.datetime) -> str:
     if message is not None:
         try:
             await message.edit(view=view, attachments=upload)
+            state = load_state()
+            state["banner_hash"] = banner_hash()
+            save_state(state)
             return "edited"
         except discord.HTTPException:
-            pass
-    else:
-        state = load_state()
-        state.pop("card_message_id", None)
-        save_state(state)
+            state = load_state()
+            state.pop("card_message_id", None)
+            save_state(state)
 
     channel = bot.get_channel(CHANNEL_ID) or await bot.fetch_channel(CHANNEL_ID)
     message = await channel.send(view=view, files=upload)
     state = load_state()
     state["card_message_id"] = message.id
     state["card_channel_id"] = CHANNEL_ID
+    state["banner_hash"] = banner_hash()
     save_state(state)
     return "posted"
 
@@ -151,9 +160,19 @@ async def ensure_card() -> None:
         except Exception:
             return
         save_state({**state, "known_version": version, "first_seen": now().isoformat()})
+        state = load_state()
     try:
         if await fetch_card_message() is None:
             await refresh_card(version, now())
+        else:
+            current_hash = banner_hash()
+            if current_hash and current_hash != state.get("banner_hash"):
+                stamp = state.get("last_announced") or state.get("first_seen")
+                try:
+                    detected_at = dt.datetime.fromisoformat(stamp)
+                except (TypeError, ValueError):
+                    detected_at = now()
+                await refresh_card(version, detected_at)
     except Exception:
         pass
 
@@ -258,12 +277,12 @@ class RecallClient(discord.Client):
         for guild in self.guilds:
             await self._sync_guild(guild)
 
-        if not roblox_update_check.is_running():
-            roblox_update_check.start()
-
         if not self._startup_done:
             self._startup_done = True
             await ensure_card()
+
+        if not roblox_update_check.is_running():
+            roblox_update_check.start()
 
     async def on_guild_join(self, guild: discord.Guild) -> None:
         await self._sync_guild(guild)
