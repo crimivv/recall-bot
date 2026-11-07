@@ -114,6 +114,27 @@ def banner_hash() -> str | None:
     return hashlib.sha256(BANNER_FILE.read_bytes()).hexdigest()
 
 
+def describe(error: Exception) -> str:
+    if isinstance(error, discord.Forbidden):
+        return ("Recall is missing channel permissions — give its role View Channel "
+                "and Send Messages in the announcement channel")
+    if isinstance(error, discord.NotFound):
+        return ("the announcement channel wasn't found — check the CHANNEL_ID in bot.py "
+                "and that Recall is in that server")
+    message = str(error)
+    return message or error.__class__.__name__
+
+
+def state_stamp(state: dict) -> dt.datetime:
+    stamp = state.get("last_announced") or state.get("first_seen")
+    if stamp:
+        try:
+            return dt.datetime.fromisoformat(stamp)
+        except (TypeError, ValueError):
+            pass
+    return now()
+
+
 async def fetch_card_message() -> discord.Message | None:
     card_id = load_state().get("card_message_id")
     if not card_id:
@@ -193,19 +214,27 @@ async def perform_check() -> str:
         try:
             if await fetch_card_message() is None:
                 await refresh_card(current_version, now())
-        except Exception:
-            pass
-        return f"First check done — memorized {current_version}."
+        except Exception as error:
+            return (f"First check done — memorized {current_version}. But the card could "
+                    f"not be posted ({describe(error)}).")
+        return f"First check done — memorized {current_version}. The card is up."
 
     if current_version == known_version:
+        if not state.get("card_message_id"):
+            try:
+                await refresh_card(current_version, state_stamp(state))
+            except Exception as error:
+                return (f"Checked Roblox — still {current_version}. The card is missing and "
+                        f"couldn't be re-posted ({describe(error)}).")
+            return f"Checked Roblox — still {current_version}. The missing card is back!"
         return f"Checked Roblox — still {current_version}, nothing new."
 
     detected_at = now()
     try:
         action = await refresh_card(current_version, detected_at)
-    except Exception:
+    except Exception as error:
         return ("A new version exists, but updating the card failed — I'll retry on "
-                "the next check. (Check my channel permissions!)")
+                f"the next check. ({describe(error)})")
 
     state = load_state()
     state["known_version"] = current_version
@@ -230,17 +259,30 @@ recall_group = app_commands.Group(
     description="See which Roblox version Recall is tracking",
 )
 async def recall_status_command(interaction: discord.Interaction) -> None:
+    await interaction.response.defer(thinking=True, ephemeral=True)
     state = load_state()
     lines = [
         f"**Tracking:** {state.get('known_version', 'not seen yet')}",
         f"Checks Roblox every **{CHECK_EVERY_MINUTES} min**",
     ]
     if state.get("last_announced"):
-        stamp = int(dt.datetime.fromisoformat(state["last_announced"]).timestamp())
+        stamp = int(state_stamp(state).timestamp())
         lines.append(f"Last card refresh: <t:{stamp}:F>")
-    lines.append("Live card: set up ✓" if state.get("card_message_id")
-                 else "Live card: not posted yet")
-    await interaction.response.send_message("\n".join(lines), ephemeral=True)
+
+    if state.get("card_message_id"):
+        lines.append("Live card: set up ✓")
+    else:
+        try:
+            version = state.get("known_version")
+            if not version:
+                version = await fetch_roblox_version()
+                save_state({**load_state(), "known_version": version,
+                            "first_seen": now().isoformat()})
+            await refresh_card(version, state_stamp(state))
+            lines.append("Live card: posted just now ✓")
+        except Exception as error:
+            lines.append(f"Live card: could not post ⚠️ — {describe(error)}")
+    await interaction.followup.send("\n".join(lines), ephemeral=True)
 
 
 @recall_group.command(
