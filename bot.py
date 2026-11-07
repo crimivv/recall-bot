@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import asyncio
 import datetime as dt
-import hashlib
 import json
 import os
 import pathlib
@@ -22,7 +21,6 @@ CHECK_EVERY_MINUTES = 1
 DOWNLOAD_PREFIX = "https://rdd.whatexpsare.online"
 VERSION_URL = "https://clientsettings.roblox.com/v2/client-version/WindowsPlayer"
 STATE_FILE = pathlib.Path(__file__).with_name("state.json")
-BANNER_FILE = pathlib.Path(__file__).with_name("assets") / "banner.png"
 
 REQUEST_HEADERS = {
     "User-Agent": "Recall-Discord-Bot/1.0",
@@ -82,15 +80,7 @@ def build_announcement(version: str, last_check: dt.datetime) -> ui.LayoutView:
         f"-# Last checked: <t:{int(last_check.timestamp())}:R>"
     )
 
-    children = []
-    if BANNER_FILE.exists():
-        children.append(
-            ui.MediaGallery(
-                discord.MediaGalleryItem(media="attachment://banner.png")
-            )
-        )
-    children += [
-        ui.Separator(visible=True, spacing=discord.SeparatorSpacing.small),
+    children = [
         ui.TextDisplay("## Current Roblox Version"),
         ui.Separator(visible=True, spacing=discord.SeparatorSpacing.small),
         ui.TextDisplay(details),
@@ -107,18 +97,6 @@ def build_announcement(version: str, last_check: dt.datetime) -> ui.LayoutView:
     return view
 
 
-def banner_attachments() -> list[discord.File]:
-    if BANNER_FILE.exists():
-        return [discord.File(BANNER_FILE, filename="banner.png")]
-    return []
-
-
-def banner_hash() -> str | None:
-    if not BANNER_FILE.exists():
-        return None
-    return hashlib.sha256(BANNER_FILE.read_bytes()).hexdigest()
-
-
 def describe(error: Exception) -> str:
     if isinstance(error, discord.Forbidden):
         return (f"Recall is missing channel permissions — give its role View Channel and "
@@ -128,16 +106,6 @@ def describe(error: Exception) -> str:
                 f"check that Recall is in that server")
     message = str(error)
     return message or error.__class__.__name__
-
-
-def check_stamp(state: dict) -> dt.datetime:
-    stamp = state.get("last_check")
-    if stamp:
-        try:
-            return dt.datetime.fromisoformat(stamp)
-        except (TypeError, ValueError):
-            pass
-    return now()
 
 
 async def fetch_card_message() -> discord.Message | None:
@@ -153,15 +121,11 @@ async def fetch_card_message() -> discord.Message | None:
 
 async def refresh_card(version: str, last_check: dt.datetime) -> str:
     view = build_announcement(version, last_check)
-    upload = banner_attachments()
 
     message = await fetch_card_message()
     if message is not None:
         try:
-            await message.edit(view=view, attachments=upload)
-            state = load_state()
-            state["banner_hash"] = banner_hash()
-            save_state(state)
+            await message.edit(view=view, attachments=[])
             return "edited"
         except discord.HTTPException:
             state = load_state()
@@ -169,11 +133,10 @@ async def refresh_card(version: str, last_check: dt.datetime) -> str:
             save_state(state)
 
     channel = bot.get_channel(CHANNEL_ID) or await bot.fetch_channel(CHANNEL_ID)
-    message = await channel.send(view=view, files=upload)
+    message = await channel.send(view=view)
     state = load_state()
     state["card_message_id"] = message.id
     state["card_channel_id"] = CHANNEL_ID
-    state["banner_hash"] = banner_hash()
     save_state(state)
     return "posted"
 
@@ -213,21 +176,6 @@ def _card_facts(message: discord.Message) -> dict:
         "version": version_match.group(1) if version_match else None,
         "check": int(check_match.group(1)) if check_match else None,
     }
-
-
-async def _card_art_matches(message: discord.Message) -> bool | None:
-    attachment = next((item for item in message.attachments
-                       if item.filename == "banner.png"), None)
-    if attachment is None:
-        return None
-    try:
-        data = await attachment.read()
-    except Exception:
-        return None
-    current_hash = banner_hash()
-    if not current_hash:
-        return False
-    return hashlib.sha256(data).hexdigest() == current_hash
 
 
 async def settle_card() -> None:
@@ -290,19 +238,8 @@ async def ensure_card() -> None:
         save_state({**state, "known_version": version})
         state = load_state()
     try:
-        message = await fetch_card_message()
-        if message is None:
+        if await fetch_card_message() is None:
             await refresh_card(version, now())
-        else:
-            uses_current_art = True
-            if BANNER_FILE.exists():
-                uses_current_art = await _card_art_matches(message) is True
-            current_hash = banner_hash()
-            art_changed = (not uses_current_art
-                           or not current_hash
-                           or current_hash != state.get("banner_hash"))
-            if art_changed:
-                await refresh_card(version, check_stamp(state))
     except Exception as error:
         print(f"[Recall] The card could not be posted: {describe(error)} "
               "— retrying at the next check")
