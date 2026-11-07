@@ -7,6 +7,7 @@ import json
 import os
 import pathlib
 import threading
+import time
 
 import aiohttp
 import discord
@@ -300,15 +301,23 @@ def _run_website() -> None:
     async def index(_request: web.Request) -> web.Response:
         return web.json_response({"ok": True, "bot": "Recall is awake!"})
 
-    app = web.Application()
-    app.router.add_get("/", index)
-    asyncio.set_event_loop(asyncio.new_event_loop())
-    web.run_app(
-        app,
-        host="0.0.0.0",
-        port=int(os.environ.get("PORT", "8080")),
-        print=None,
-    )
+    async def serve() -> None:
+        app = web.Application()
+        app.router.add_get("/", index)
+        runner = web.AppRunner(app, handle_signals=False)
+        await runner.setup()
+        await web.TCPSite(
+            runner,
+            host="0.0.0.0",
+            port=int(os.environ.get("PORT", "8080")),
+        ).start()
+        await asyncio.Event().wait()
+
+    while True:
+        try:
+            asyncio.run(serve())
+        except Exception:
+            time.sleep(3)
 
 
 def main() -> None:
