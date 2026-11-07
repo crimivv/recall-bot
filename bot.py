@@ -17,7 +17,7 @@ from discord import app_commands, ui
 from discord.ext import tasks
 
 CHANNEL_ID = 1568033554993250405
-CHECK_EVERY_MINUTES = 5
+CHECK_EVERY_MINUTES = 1
 DOWNLOAD_URL = "https://www.roblox.com/download"
 VERSION_URL = "https://clientsettings.roblox.com/v2/client-version/WindowsPlayer"
 STATE_FILE = pathlib.Path(__file__).with_name("state.json")
@@ -78,7 +78,7 @@ def build_announcement(
         "**Platform:** Windows\n"
         f"**Roblox Version:** `{version}`\n"
         f"**Detected:** <t:{int(detected_at.timestamp())}:F>\n"
-        f"-# Auto-updated. Last check: <t:{int(visible_check.timestamp())}:R>"
+        f"-# Last checked: <t:{int(visible_check.timestamp())}:R>"
     )
 
     children = []
@@ -339,7 +339,7 @@ async def perform_check() -> str:
         current_version = await fetch_roblox_version()
     except Exception:
         return (f"Couldn't reach Roblox's version API — will retry at the next check "
-                f"(every {CHECK_EVERY_MINUTES} minutes).")
+                f"(every {CHECK_EVERY_MINUTES} min).")
 
     if not known_version:
         check_time = now()
