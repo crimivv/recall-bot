@@ -84,7 +84,7 @@ widths = [letter_L, letter_I, letter_V, letter_E]
 total = CAP * 0.78 + STROKE + CAP * 0.92 + CAP * 0.70 + GAP * 3
 
 group = sq_half * 2 + square_gap + total
-left = (W * S - group) / 2
+left = 0.025 * W * S
 cx = left + sq_half
 cursor = cx + sq_half + square_gap
 
