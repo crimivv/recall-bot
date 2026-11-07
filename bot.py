@@ -116,11 +116,11 @@ def banner_hash() -> str | None:
 
 def describe(error: Exception) -> str:
     if isinstance(error, discord.Forbidden):
-        return ("Recall is missing channel permissions — give its role View Channel "
-                "and Send Messages in the announcement channel")
+        return (f"Recall is missing channel permissions — give its role View Channel and "
+                f"Send Messages in channel {CHANNEL_ID} (the '📦｜roblox-updates' channel)")
     if isinstance(error, discord.NotFound):
-        return ("the announcement channel wasn't found — check the CHANNEL_ID in bot.py "
-                "and that Recall is in that server")
+        return (f"channel {CHANNEL_ID} (the '📦｜roblox-updates' channel) wasn't found — "
+                f"check that Recall is in that server")
     message = str(error)
     return message or error.__class__.__name__
 
@@ -180,6 +180,8 @@ async def ensure_card() -> None:
         try:
             version = await fetch_roblox_version()
         except Exception:
+            print("[Recall] Roblox's version API isn't answering at startup — "
+                  "the card appears at the next check")
             return
         save_state({**state, "known_version": version, "first_seen": now().isoformat()})
         state = load_state()
@@ -189,14 +191,10 @@ async def ensure_card() -> None:
         else:
             current_hash = banner_hash()
             if current_hash and current_hash != state.get("banner_hash"):
-                stamp = state.get("last_announced") or state.get("first_seen")
-                try:
-                    detected_at = dt.datetime.fromisoformat(stamp)
-                except (TypeError, ValueError):
-                    detected_at = now()
-                await refresh_card(version, detected_at)
-    except Exception:
-        pass
+                await refresh_card(version, state_stamp(state))
+    except Exception as error:
+        print(f"[Recall] The card could not be posted: {describe(error)} "
+              "— retrying at the next check")
 
 
 async def perform_check() -> str:
@@ -215,6 +213,8 @@ async def perform_check() -> str:
             if await fetch_card_message() is None:
                 await refresh_card(current_version, now())
         except Exception as error:
+            print(f"[Recall] The card could not be posted: {describe(error)} "
+                  "— retrying at the next check")
             return (f"First check done — memorized {current_version}. But the card could "
                     f"not be posted ({describe(error)}).")
         return f"First check done — memorized {current_version}. The card is up."
@@ -224,6 +224,7 @@ async def perform_check() -> str:
             try:
                 await refresh_card(current_version, state_stamp(state))
             except Exception as error:
+                print(f"[Recall] The card is missing but couldn't be re-posted: {describe(error)}")
                 return (f"Checked Roblox — still {current_version}. The card is missing and "
                         f"couldn't be re-posted ({describe(error)}).")
             return f"Checked Roblox — still {current_version}. The missing card is back!"
@@ -233,6 +234,7 @@ async def perform_check() -> str:
     try:
         action = await refresh_card(current_version, detected_at)
     except Exception as error:
+        print(f"[Recall] Card update failed for the new version: {describe(error)}")
         return ("A new version exists, but updating the card failed — I'll retry on "
                 f"the next check. ({describe(error)})")
 
@@ -265,6 +267,15 @@ async def recall_status_command(interaction: discord.Interaction) -> None:
         f"**Tracking:** {state.get('known_version', 'not seen yet')}",
         f"Checks Roblox every **{CHECK_EVERY_MINUTES} min**",
     ]
+    try:
+        channel = bot.get_channel(CHANNEL_ID) or await bot.fetch_channel(CHANNEL_ID)
+        lines.append(f"**Channel:** {channel.mention} — visible ✓")
+    except discord.NotFound:
+        lines.append(f"**Channel:** `{CHANNEL_ID}` — not found (wrong ID, or Recall is in another server)")
+    except discord.Forbidden:
+        lines.append(f"**Channel:** `{CHANNEL_ID}` — Recall can't view it (fix View Channel for its role)")
+    except Exception as error:
+        lines.append(f"**Channel:** `{CHANNEL_ID}` — {describe(error)}")
     if state.get("last_announced"):
         stamp = int(state_stamp(state).timestamp())
         lines.append(f"Last card refresh: <t:{stamp}:F>")
