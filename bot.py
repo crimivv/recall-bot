@@ -81,7 +81,7 @@ def build_announcement(version: str, last_check: dt.datetime) -> ui.LayoutView:
     )
 
     children = [
-        ui.TextDisplay("## Current Supported Roblox Version"),
+        ui.TextDisplay("## Current Roblox Version"),
         ui.Separator(visible=True, spacing=discord.SeparatorSpacing.small),
         ui.TextDisplay(details),
         ui.Separator(visible=True, spacing=discord.SeparatorSpacing.small),
