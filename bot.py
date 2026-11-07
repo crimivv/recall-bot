@@ -6,6 +6,7 @@ import hashlib
 import json
 import os
 import pathlib
+import re
 import threading
 import time
 
@@ -65,13 +66,19 @@ async def fetch_roblox_version() -> str:
     return pick_version(data)
 
 
-def build_announcement(version: str, detected_at: dt.datetime) -> ui.LayoutView:
+def build_announcement(
+    version: str,
+    detected_at: dt.datetime,
+    last_check: dt.datetime | None = None,
+) -> ui.LayoutView:
     view = ui.LayoutView(timeout=None)
+    visible_check = last_check or detected_at
 
     details = (
         "**Platform:** Windows\n"
         f"**Roblox Version:** `{version}`\n"
-        f"**Detected:** <t:{int(detected_at.timestamp())}:F>"
+        f"**Detected:** <t:{int(detected_at.timestamp())}:F>\n"
+        f"-# Auto-updated. Last check: <t:{int(visible_check.timestamp())}:R>"
     )
 
     children = []
@@ -135,6 +142,16 @@ def state_stamp(state: dict) -> dt.datetime:
     return now()
 
 
+def check_stamp(state: dict) -> dt.datetime:
+    stamp = state.get("last_check")
+    if stamp:
+        try:
+            return dt.datetime.fromisoformat(stamp)
+        except (TypeError, ValueError):
+            pass
+    return now()
+
+
 async def fetch_card_message() -> discord.Message | None:
     card_id = load_state().get("card_message_id")
     if not card_id:
@@ -146,8 +163,12 @@ async def fetch_card_message() -> discord.Message | None:
         return None
 
 
-async def refresh_card(version: str, detected_at: dt.datetime) -> str:
-    view = build_announcement(version, detected_at)
+async def refresh_card(
+    version: str,
+    detected_at: dt.datetime,
+    last_check: dt.datetime | None = None,
+) -> str:
+    view = build_announcement(version, detected_at, last_check)
     upload = banner_attachments()
 
     message = await fetch_card_message()
@@ -173,7 +194,113 @@ async def refresh_card(version: str, detected_at: dt.datetime) -> str:
     return "posted"
 
 
+def _component_text(component) -> str:
+    parts = []
+    if isinstance(component, dict):
+        parts.append(str(component.get("content") or ""))
+        parts.append(str(component.get("label") or ""))
+        parts.append(str(component.get("url") or ""))
+        children = component.get("components") or component.get("items") or []
+    else:
+        parts.append(str(getattr(component, "content", "") or ""))
+        parts.append(str(getattr(component, "label", "") or ""))
+        parts.append(str(getattr(component, "url", "") or ""))
+        children = (getattr(component, "children", None)
+                    or getattr(component, "items", None)
+                    or [])
+    for child in children:
+        parts.append(_component_text(child))
+    return " ".join(parts)
+
+
+def _is_recall_card(message: discord.Message) -> bool:
+    text = " ".join(_component_text(component)
+                    for component in (message.components or [])).lower()
+    return "recall" in text and "live update detected" in text
+
+
+def _card_facts(message: discord.Message) -> dict:
+    text = " ".join(_component_text(component)
+                    for component in (message.components or []))
+    version_match = re.search(r"`(version-[0-9a-zA-Z]+)`", text)
+    stamp_match = re.search(r"<t:(\d+):[a-zA-Z]>", text)
+    check_match = re.search(r"<t:(\d+):R>", text)
+    return {
+        "version": version_match.group(1) if version_match else None,
+        "stamp": int(stamp_match.group(1)) if stamp_match else None,
+        "check": int(check_match.group(1)) if check_match else None,
+    }
+
+
+async def _card_art_matches(message: discord.Message) -> bool | None:
+    attachment = next((item for item in message.attachments
+                       if item.filename == "banner.png"), None)
+    if attachment is None:
+        return None
+    try:
+        data = await attachment.read()
+    except Exception:
+        return None
+    current_hash = banner_hash()
+    if not current_hash:
+        return False
+    return hashlib.sha256(data).hexdigest() == current_hash
+
+
+async def settle_card() -> None:
+    state = load_state()
+    keep_id = state.get("card_message_id")
+    try:
+        channel = bot.get_channel(CHANNEL_ID) or await bot.fetch_channel(CHANNEL_ID)
+    except Exception:
+        return
+    try:
+        history = [message async for message in channel.history(limit=100)]
+    except discord.HTTPException:
+        return
+    recall_cards = [message for message in history
+                    if message.author == bot.user and _is_recall_card(message)]
+    anchor = None
+    if keep_id:
+        anchor = next((message for message in recall_cards
+                       if message.id == keep_id), None)
+    if anchor is None and recall_cards:
+        anchor = recall_cards[0]
+    if anchor is None:
+        return
+    for message in recall_cards:
+        if message.id == anchor.id:
+            continue
+        try:
+            await message.delete()
+        except discord.HTTPException:
+            pass
+    if anchor.id == keep_id:
+        return
+    facts = _card_facts(anchor)
+    stamp = (dt.datetime.fromtimestamp(facts["stamp"], dt.timezone.utc)
+             if facts["stamp"] is not None else None)
+    check = (dt.datetime.fromtimestamp(facts["check"], dt.timezone.utc)
+             if facts["check"] is not None else None)
+    state = load_state()
+    if facts["version"] and not state.get("known_version"):
+        state["known_version"] = facts["version"]
+    if stamp:
+        iso = stamp.isoformat()
+        state.setdefault("first_seen", iso)
+        state.setdefault("last_announced", iso)
+    if check:
+        state.setdefault("last_check", check.isoformat())
+    state["card_message_id"] = anchor.id
+    state["card_channel_id"] = CHANNEL_ID
+    save_state(state)
+
+
 async def ensure_card() -> None:
+    try:
+        await settle_card()
+    except Exception:
+        pass
     state = load_state()
     version = state.get("known_version")
     if not version:
@@ -186,12 +313,19 @@ async def ensure_card() -> None:
         save_state({**state, "known_version": version, "first_seen": now().isoformat()})
         state = load_state()
     try:
-        if await fetch_card_message() is None:
+        message = await fetch_card_message()
+        if message is None:
             await refresh_card(version, now())
         else:
+            uses_current_art = True
+            if BANNER_FILE.exists():
+                uses_current_art = await _card_art_matches(message) is True
             current_hash = banner_hash()
-            if current_hash and current_hash != state.get("banner_hash"):
-                await refresh_card(version, state_stamp(state))
+            art_changed = (not uses_current_art
+                           or not current_hash
+                           or current_hash != state.get("banner_hash"))
+            if art_changed:
+                await refresh_card(version, state_stamp(state), check_stamp(state))
     except Exception as error:
         print(f"[Recall] The card could not be posted: {describe(error)} "
               "— retrying at the next check")
@@ -208,31 +342,49 @@ async def perform_check() -> str:
                 f"(every {CHECK_EVERY_MINUTES} minutes).")
 
     if not known_version:
-        save_state({**state, "known_version": current_version, "first_seen": now().isoformat()})
+        check_time = now()
+        save_state({**state, "known_version": current_version,
+                    "first_seen": check_time.isoformat()})
         try:
             if await fetch_card_message() is None:
-                await refresh_card(current_version, now())
+                await refresh_card(current_version, check_time)
         except Exception as error:
             print(f"[Recall] The card could not be posted: {describe(error)} "
                   "— retrying at the next check")
             return (f"First check done — memorized {current_version}. But the card could "
                     f"not be posted ({describe(error)}).")
+        state = load_state()
+        state["last_check"] = check_time.isoformat()
+        save_state(state)
         return f"First check done — memorized {current_version}. The card is up."
 
     if current_version == known_version:
+        check_time = now()
         if not state.get("card_message_id"):
             try:
-                await refresh_card(current_version, state_stamp(state))
+                await refresh_card(current_version, state_stamp(state), check_time)
             except Exception as error:
                 print(f"[Recall] The card is missing but couldn't be re-posted: {describe(error)}")
                 return (f"Checked Roblox — still {current_version}. The card is missing and "
                         f"couldn't be re-posted ({describe(error)}).")
+            state = load_state()
+            state["last_check"] = check_time.isoformat()
+            save_state(state)
             return f"Checked Roblox — still {current_version}. The missing card is back!"
+        try:
+            await refresh_card(current_version, state_stamp(state), check_time)
+        except Exception as error:
+            print(f"[Recall] The card's last-check stamp couldn't be updated: {describe(error)}")
+            return (f"Checked Roblox — still {current_version}, nothing new. "
+                    f"(Stamp refresh failed — {describe(error)})")
+        state = load_state()
+        state["last_check"] = check_time.isoformat()
+        save_state(state)
         return f"Checked Roblox — still {current_version}, nothing new."
 
     detected_at = now()
     try:
-        action = await refresh_card(current_version, detected_at)
+        action = await refresh_card(current_version, detected_at, detected_at)
     except Exception as error:
         print(f"[Recall] Card update failed for the new version: {describe(error)}")
         return ("A new version exists, but updating the card failed — I'll retry on "
@@ -241,6 +393,7 @@ async def perform_check() -> str:
     state = load_state()
     state["known_version"] = current_version
     state["last_announced"] = detected_at.isoformat()
+    state["last_check"] = detected_at.isoformat()
     save_state(state)
     return f"New Roblox version! {current_version} — live card {action}."
 
@@ -279,6 +432,9 @@ async def recall_status_command(interaction: discord.Interaction) -> None:
     if state.get("last_announced"):
         stamp = int(state_stamp(state).timestamp())
         lines.append(f"Last card refresh: <t:{stamp}:F>")
+    if state.get("last_check"):
+        check_hint = int(check_stamp(state).timestamp())
+        lines.append(f"Last Roblox check: <t:{check_hint}:R>")
 
     if state.get("card_message_id"):
         lines.append("Live card: set up ✓")

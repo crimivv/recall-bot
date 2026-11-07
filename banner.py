@@ -74,18 +74,22 @@ def letter_E(x: float, y: float) -> float:
 
 
 side = 0.74 * H * S
-cx = 0.29 * W * S
 cy = H * S / 2
-
-rotated_square(cx, cy, side, SQUARE_ANGLE, RED)
-rotated_square(cx, cy, side * HOLE_RATIO, SQUARE_ANGLE, TRANSPARENT)
+angle_rad = math.radians(SQUARE_ANGLE)
+sq_half = side / 2 * (abs(math.cos(angle_rad)) + abs(math.sin(angle_rad)))
+square_gap = 0.025 * W * S
 
 start_y = (H * S - CAP) / 2
 widths = [letter_L, letter_I, letter_V, letter_E]
 total = CAP * 0.78 + STROKE + CAP * 0.92 + CAP * 0.70 + GAP * 3
 
-cursor = cx + side * 0.62 + 0.005 * W * S
-cursor += ((W * S - 0.025 * W * S) - (cursor + total)) / 2
+group = sq_half * 2 + square_gap + total
+left = (W * S - group) / 2
+cx = left + sq_half
+cursor = cx + sq_half + square_gap
+
+rotated_square(cx, cy, side, SQUARE_ANGLE, RED)
+rotated_square(cx, cy, side * HOLE_RATIO, SQUARE_ANGLE, TRANSPARENT)
 
 for drawing_fn in widths:
     used = drawing_fn(cursor, start_y)
