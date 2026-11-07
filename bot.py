@@ -13,12 +13,13 @@ import time
 import aiohttp
 import discord
 from aiohttp import web
-from discord import app_commands, ui
+from discord import ui
 from discord.ext import tasks
+from urllib.parse import urlencode
 
 CHANNEL_ID = 1568033554993250405
 CHECK_EVERY_MINUTES = 1
-DOWNLOAD_URL = "https://www.roblox.com/download"
+DOWNLOAD_PREFIX = "https://rdd.whatexpsare.online"
 VERSION_URL = "https://clientsettings.roblox.com/v2/client-version/WindowsPlayer"
 STATE_FILE = pathlib.Path(__file__).with_name("state.json")
 BANNER_FILE = pathlib.Path(__file__).with_name("assets") / "banner.png"
@@ -66,19 +67,19 @@ async def fetch_roblox_version() -> str:
     return pick_version(data)
 
 
-def build_announcement(
-    version: str,
-    detected_at: dt.datetime,
-    last_check: dt.datetime | None = None,
-) -> ui.LayoutView:
+def download_link(version: str) -> str:
+    params = urlencode({"channel": "LIVE", "binaryType": "WindowsPlayer",
+                        "version": version})
+    return f"{DOWNLOAD_PREFIX}?{params}"
+
+
+def build_announcement(version: str, last_check: dt.datetime) -> ui.LayoutView:
     view = ui.LayoutView(timeout=None)
-    visible_check = last_check or detected_at
 
     details = (
         "**Platform:** Windows\n"
         f"**Roblox Version:** `{version}`\n"
-        f"**Detected:** <t:{int(detected_at.timestamp())}:F>\n"
-        f"-# Last checked: <t:{int(visible_check.timestamp())}:R>"
+        f"-# Last checked: <t:{int(last_check.timestamp())}:R>"
     )
 
     children = []
@@ -90,10 +91,7 @@ def build_announcement(
         )
     children += [
         ui.Separator(visible=True, spacing=discord.SeparatorSpacing.small),
-        ui.TextDisplay(
-            "## Live update detected!\n"
-            "A new ROBLOX LIVE version is out. Recall has been auto-updated to match."
-        ),
+        ui.TextDisplay("## Current Version"),
         ui.Separator(visible=True, spacing=discord.SeparatorSpacing.small),
         ui.TextDisplay(details),
         ui.Separator(visible=True, spacing=discord.SeparatorSpacing.small),
@@ -101,7 +99,7 @@ def build_announcement(
             ui.Button(
                 label="Download",
                 style=discord.ButtonStyle.link,
-                url=DOWNLOAD_URL,
+                url=download_link(version),
             )
         ),
     ]
@@ -132,16 +130,6 @@ def describe(error: Exception) -> str:
     return message or error.__class__.__name__
 
 
-def state_stamp(state: dict) -> dt.datetime:
-    stamp = state.get("last_announced") or state.get("first_seen")
-    if stamp:
-        try:
-            return dt.datetime.fromisoformat(stamp)
-        except (TypeError, ValueError):
-            pass
-    return now()
-
-
 def check_stamp(state: dict) -> dt.datetime:
     stamp = state.get("last_check")
     if stamp:
@@ -163,12 +151,8 @@ async def fetch_card_message() -> discord.Message | None:
         return None
 
 
-async def refresh_card(
-    version: str,
-    detected_at: dt.datetime,
-    last_check: dt.datetime | None = None,
-) -> str:
-    view = build_announcement(version, detected_at, last_check)
+async def refresh_card(version: str, last_check: dt.datetime) -> str:
+    view = build_announcement(version, last_check)
     upload = banner_attachments()
 
     message = await fetch_card_message()
@@ -216,18 +200,17 @@ def _component_text(component) -> str:
 def _is_recall_card(message: discord.Message) -> bool:
     text = " ".join(_component_text(component)
                     for component in (message.components or [])).lower()
-    return "recall" in text and "live update detected" in text
+    return "whatexpsare.online" in text or "roblox.com/download" in text
 
 
 def _card_facts(message: discord.Message) -> dict:
     text = " ".join(_component_text(component)
                     for component in (message.components or []))
     version_match = re.search(r"`(version-[0-9a-zA-Z]+)`", text)
-    stamp_match = re.search(r"<t:(\d+):[a-zA-Z]>", text)
-    check_match = re.search(r"<t:(\d+):R>", text)
+    check_match = (re.search(r"<t:(\d+):R>", text)
+                   or re.search(r"<t:(\d+):[a-zA-Z]>", text))
     return {
         "version": version_match.group(1) if version_match else None,
-        "stamp": int(stamp_match.group(1)) if stamp_match else None,
         "check": int(check_match.group(1)) if check_match else None,
     }
 
@@ -278,17 +261,11 @@ async def settle_card() -> None:
     if anchor.id == keep_id:
         return
     facts = _card_facts(anchor)
-    stamp = (dt.datetime.fromtimestamp(facts["stamp"], dt.timezone.utc)
-             if facts["stamp"] is not None else None)
     check = (dt.datetime.fromtimestamp(facts["check"], dt.timezone.utc)
              if facts["check"] is not None else None)
     state = load_state()
     if facts["version"] and not state.get("known_version"):
         state["known_version"] = facts["version"]
-    if stamp:
-        iso = stamp.isoformat()
-        state.setdefault("first_seen", iso)
-        state.setdefault("last_announced", iso)
     if check:
         state.setdefault("last_check", check.isoformat())
     state["card_message_id"] = anchor.id
@@ -310,7 +287,7 @@ async def ensure_card() -> None:
             print("[Recall] Roblox's version API isn't answering at startup — "
                   "the card appears at the next check")
             return
-        save_state({**state, "known_version": version, "first_seen": now().isoformat()})
+        save_state({**state, "known_version": version})
         state = load_state()
     try:
         message = await fetch_card_message()
@@ -325,77 +302,70 @@ async def ensure_card() -> None:
                            or not current_hash
                            or current_hash != state.get("banner_hash"))
             if art_changed:
-                await refresh_card(version, state_stamp(state), check_stamp(state))
+                await refresh_card(version, check_stamp(state))
     except Exception as error:
         print(f"[Recall] The card could not be posted: {describe(error)} "
               "— retrying at the next check")
 
 
-async def perform_check() -> str:
+async def perform_check() -> None:
     state = load_state()
     known_version = state.get("known_version")
 
     try:
         current_version = await fetch_roblox_version()
     except Exception:
-        return (f"Couldn't reach Roblox's version API — will retry at the next check "
-                f"(every {CHECK_EVERY_MINUTES} min).")
+        print("[Recall] Couldn't reach Roblox's version API — will retry at the next check")
+        return
 
     if not known_version:
         check_time = now()
-        save_state({**state, "known_version": current_version,
-                    "first_seen": check_time.isoformat()})
+        save_state({**state, "known_version": current_version})
         try:
             if await fetch_card_message() is None:
                 await refresh_card(current_version, check_time)
         except Exception as error:
             print(f"[Recall] The card could not be posted: {describe(error)} "
                   "— retrying at the next check")
-            return (f"First check done — memorized {current_version}. But the card could "
-                    f"not be posted ({describe(error)}).")
+            return
         state = load_state()
         state["last_check"] = check_time.isoformat()
         save_state(state)
-        return f"First check done — memorized {current_version}. The card is up."
+        return
 
     if current_version == known_version:
         check_time = now()
         if not state.get("card_message_id"):
             try:
-                await refresh_card(current_version, state_stamp(state), check_time)
+                await refresh_card(current_version, check_time)
             except Exception as error:
                 print(f"[Recall] The card is missing but couldn't be re-posted: {describe(error)}")
-                return (f"Checked Roblox — still {current_version}. The card is missing and "
-                        f"couldn't be re-posted ({describe(error)}).")
+                return
             state = load_state()
             state["last_check"] = check_time.isoformat()
             save_state(state)
-            return f"Checked Roblox — still {current_version}. The missing card is back!"
+            return
         try:
-            await refresh_card(current_version, state_stamp(state), check_time)
+            await refresh_card(current_version, check_time)
         except Exception as error:
             print(f"[Recall] The card's last-check stamp couldn't be updated: {describe(error)}")
-            return (f"Checked Roblox — still {current_version}, nothing new. "
-                    f"(Stamp refresh failed — {describe(error)})")
+            return
         state = load_state()
         state["last_check"] = check_time.isoformat()
         save_state(state)
-        return f"Checked Roblox — still {current_version}, nothing new."
+        return
 
-    detected_at = now()
+    check_time = now()
     try:
-        action = await refresh_card(current_version, detected_at, detected_at)
+        await refresh_card(current_version, check_time)
     except Exception as error:
         print(f"[Recall] Card update failed for the new version: {describe(error)}")
-        return ("A new version exists, but updating the card failed — I'll retry on "
-                f"the next check. ({describe(error)})")
+        return
 
     state = load_state()
     state["known_version"] = current_version
-    state["last_announced"] = detected_at.isoformat()
-    state["last_check"] = detected_at.isoformat()
+    state["last_check"] = check_time.isoformat()
     save_state(state)
-    return f"New Roblox version! {current_version} — live card {action}."
 
 
 @tasks.loop(minutes=CHECK_EVERY_MINUTES)
@@ -403,89 +373,28 @@ async def roblox_update_check() -> None:
     await perform_check()
 
 
-recall_group = app_commands.Group(
-    name="recall",
-    description="Roblox update card commands",
-)
-
-
-@recall_group.command(
-    name="status",
-    description="See which Roblox version Recall is tracking",
-)
-async def recall_status_command(interaction: discord.Interaction) -> None:
-    await interaction.response.defer(thinking=True, ephemeral=True)
-    state = load_state()
-    lines = [
-        f"**Tracking:** {state.get('known_version', 'not seen yet')}",
-        f"Checks Roblox every **{CHECK_EVERY_MINUTES} min**",
-    ]
-    try:
-        channel = bot.get_channel(CHANNEL_ID) or await bot.fetch_channel(CHANNEL_ID)
-        lines.append(f"**Channel:** {channel.mention} — visible ✓")
-    except discord.NotFound:
-        lines.append(f"**Channel:** `{CHANNEL_ID}` — not found (wrong ID, or Recall is in another server)")
-    except discord.Forbidden:
-        lines.append(f"**Channel:** `{CHANNEL_ID}` — Recall can't view it (fix View Channel for its role)")
-    except Exception as error:
-        lines.append(f"**Channel:** `{CHANNEL_ID}` — {describe(error)}")
-    if state.get("last_announced"):
-        stamp = int(state_stamp(state).timestamp())
-        lines.append(f"Last card refresh: <t:{stamp}:F>")
-    if state.get("last_check"):
-        check_hint = int(check_stamp(state).timestamp())
-        lines.append(f"Last Roblox check: <t:{check_hint}:R>")
-
-    if state.get("card_message_id"):
-        lines.append("Live card: set up ✓")
-    else:
-        try:
-            version = state.get("known_version")
-            if not version:
-                version = await fetch_roblox_version()
-                save_state({**load_state(), "known_version": version,
-                            "first_seen": now().isoformat()})
-            await refresh_card(version, state_stamp(state))
-            lines.append("Live card: posted just now ✓")
-        except Exception as error:
-            lines.append(f"Live card: could not post ⚠️ — {describe(error)}")
-    await interaction.followup.send("\n".join(lines), ephemeral=True)
-
-
-@recall_group.command(
-    name="check",
-    description="Check Roblox right now and refresh the live card",
-)
-async def recall_check_command(interaction: discord.Interaction) -> None:
-    await interaction.response.defer(thinking=True, ephemeral=True)
-    summary = await perform_check()
-    await interaction.followup.send(summary, ephemeral=True)
-
-
 class RecallClient(discord.Client):
     def __init__(self) -> None:
         super().__init__(intents=intents)
-        self.tree = app_commands.CommandTree(self)
-        self._guilds_synced: set[int] = set()
+        self.tree = discord.app_commands.CommandTree(self)
+        self._commands_cleared: set[int] = set()
         self._startup_done = False
 
     async def setup_hook(self) -> None:
-        self.tree.add_command(recall_group)
         await self.tree.sync()
 
-    async def _sync_guild(self, guild: discord.Guild) -> None:
-        if guild.id in self._guilds_synced:
+    async def _clear_guild_commands(self, guild: discord.Guild) -> None:
+        if guild.id in self._commands_cleared:
             return
         try:
-            self.tree.copy_global_to(guild=discord.Object(id=guild.id))
             await self.tree.sync(guild=discord.Object(id=guild.id))
-            self._guilds_synced.add(guild.id)
+            self._commands_cleared.add(guild.id)
         except discord.HTTPException:
             pass
 
     async def on_ready(self) -> None:
         for guild in self.guilds:
-            await self._sync_guild(guild)
+            await self._clear_guild_commands(guild)
 
         if not self._startup_done:
             self._startup_done = True
@@ -495,7 +404,7 @@ class RecallClient(discord.Client):
             roblox_update_check.start()
 
     async def on_guild_join(self, guild: discord.Guild) -> None:
-        await self._sync_guild(guild)
+        await self._clear_guild_commands(guild)
 
 
 bot = RecallClient()
